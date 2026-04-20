@@ -1,0 +1,35 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.status == 'Active';
+    }
+
+    function isRole(role) {
+      return isSignedIn() && request.auth.token.role == role;
+    }
+
+    function isManagement() {
+      return isSignedIn()
+        && (
+          request.auth.token.role == 'HOD'
+          || request.auth.token.role == 'Manager'
+          || request.auth.token.role == 'Chief Manager'
+        );
+    }
+
+    match /test_requests/{requestId}/{allPaths=**} {
+      allow read: if isSignedIn();
+      allow write: if isRole('PDC') || isRole('HOD');
+    }
+
+    match /reports/{assignmentId}/{allPaths=**} {
+      allow read: if isSignedIn();
+      allow write: if isRole('Engineer') || isRole('HOD') || isManagement();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
