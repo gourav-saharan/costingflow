@@ -86,13 +86,13 @@ button {
 /* SHELL & SIDEBAR */
 .app-shell {
   display: grid;
-  grid-template-columns: 240px 1fr;
+  grid-template-columns: 240px minmax(0, 1fr);
   min-height: 100vh;
   transition: grid-template-columns 0.35s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .app-shell.collapsed {
-  grid-template-columns: 80px 1fr;
+  grid-template-columns: 80px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -203,6 +203,8 @@ button {
 .content-shell {
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .topbar {
@@ -265,11 +267,16 @@ button {
 .page-shell {
   padding: 16px 24px;
   flex: 1;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .page {
   display: grid;
   gap: 24px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .page-header {
@@ -277,6 +284,8 @@ button {
   justify-content: space-between;
   align-items: flex-start;
   gap: 20px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .page-header h1,

@@ -89,6 +89,16 @@ service cloud.firestore {
     match /costing_master/{docId} {
       allow read: if hasPermission('viewCosting') || hasPermission('editCosting');
       allow write: if hasPermission('editCosting');
+
+      match /sheets/{sheetId} {
+        allow read: if hasPermission('viewCosting') || hasPermission('editCosting');
+        allow write: if hasPermission('editCosting');
+
+        match /chunks/{chunkId} {
+          allow read: if hasPermission('viewCosting') || hasPermission('editCosting');
+          allow write: if hasPermission('editCosting');
+        }
+      }
     }
 
     match /{document=**} {

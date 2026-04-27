@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Outlet, useNavigate } from 'react-router-dom'
 import Sidebar from './Sidebar'
 import { useAuth } from '../contexts/AuthContext'
@@ -7,7 +7,18 @@ import { Search, Bell, HelpCircle, LogOut } from 'lucide-react'
 export default function Layout() {
   const { profile, logout } = useAuth()
   const navigate = useNavigate()
-  const [isCollapsed, setIsCollapsed] = useState(false)
+  const [isCollapsed, setIsCollapsed] = useState(() => {
+    if (typeof window === 'undefined') {
+      return true
+    }
+
+    const saved = window.localStorage.getItem('sidebar-collapsed')
+    return saved === null ? true : saved === 'true'
+  })
+
+  useEffect(() => {
+    window.localStorage.setItem('sidebar-collapsed', String(isCollapsed))
+  }, [isCollapsed])
 
   async function handleLogout() {
     await logout()
