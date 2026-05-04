@@ -12,25 +12,25 @@ import { canCreateRequest } from '../lib/permissions'
 import { createDraftId, uploadFiles, workflowApi } from '../services/workflow'
 
 const CONTRACT_REVIEW_OPTIONS = [
-  'Applicable – Contract Reviewed & Approved',
-  'Not Applicable – Internal Test',
+  'Applicable - Contract Reviewed & Approved',
+  'Not Applicable - Internal Test',
   'Pending Review',
 ]
 
 const LAB_OPTIONS = [
-  'Physical Lab – Mysuru (RPSCOE)',
-  'Physical Lab – Indore (NATRAX)',
+  'Physical Lab - Mysuru (RPSCOE)',
+  'Physical Lab - Indore (NATRAX)',
   'Virtual Simulation Lab',
 ]
 
+const MAX_ATTACHMENT_SIZE_MB = 10
+
 const emptyForm = {
-  // Existing fields (untouched)
   projectId: '',
   testId: '',
   tyreDetails: '',
   testType: '',
   priority: 'Medium',
-  // New fields from mockup
   htacNo: '',
   dateOfReceipt: '',
   referenceNo: '',
@@ -48,15 +48,62 @@ const emptyForm = {
   activeStatus: 'Active',
 }
 
+const emptyOcrState = {
+  loading: false,
+  error: '',
+  sourceName: '',
+  detectedFieldCount: 0,
+  pagesProcessed: 0,
+  warnings: [],
+}
+
+function mergeOcrSuggestions(current, suggestions) {
+  const next = { ...current }
+
+  for (const [field, value] of Object.entries(suggestions || {})) {
+    if (typeof value === 'boolean') {
+      if (current[field] === emptyForm[field]) {
+        next[field] = value
+      }
+      continue
+    }
+
+    if (!value) {
+      continue
+    }
+
+    const currentValue = current[field]
+    const shouldApply =
+      currentValue === '' ||
+      currentValue === null ||
+      currentValue === undefined ||
+      currentValue === emptyForm[field]
+
+    if (shouldApply) {
+      next[field] = value
+    }
+  }
+
+  if (next.physicalLab && current.physicalLabEnabled === emptyForm.physicalLabEnabled) {
+    next.physicalLabEnabled = next.physicalLab !== 'Virtual Simulation Lab'
+  }
+
+  return next
+}
+
 export default function TestRequests() {
   const { profile } = useAuth()
   const [requests, setRequests] = useState([])
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [isModalOpen, setIsModalOpen] = useState(false)
+  const [draftRequestId, setDraftRequestId] = useState(() => createDraftId('test_requests'))
   const [form, setForm] = useState(emptyForm)
   const [files, setFiles] = useState([])
+  const [uploadedAttachments, setUploadedAttachments] = useState([])
+  const [uploadingAttachments, setUploadingAttachments] = useState(false)
   const [fileDragOver, setFileDragOver] = useState(false)
+  const [ocrState, setOcrState] = useState(emptyOcrState)
 
   const fileInputRef = useRef(null)
 
@@ -74,29 +121,123 @@ export default function TestRequests() {
     loadRequests()
   }, [])
 
-  /* ─── Drag-Drop helpers ─── */
-  function handleDrop(e, setter, maxMB = 10) {
-    e.preventDefault()
-    const dropped = Array.from(e.dataTransfer.files).filter(f => f.size <= maxMB * 1024 * 1024)
-    setter(prev => [...prev, ...dropped])
+  async function runOcrForAttachment(attachment) {
+    if (!attachment) {
+      return
+    }
+
+    setOcrState((current) => ({
+      ...current,
+      loading: true,
+      error: '',
+      sourceName: attachment.name,
+    }))
+
+    try {
+      const result = await workflowApi.extractTestRequestFromDocument({
+        name: attachment.name,
+        bucket: attachment.bucket,
+        fullPath: attachment.fullPath,
+        contentType: attachment.contentType,
+      })
+
+      const suggestions = result.suggestions || {}
+      const detectedFieldCount = Object.values(suggestions).filter((value) => value !== '' && value !== false && value !== null && value !== undefined).length
+
+      setForm((current) => mergeOcrSuggestions(current, suggestions))
+      setOcrState({
+        loading: false,
+        error: '',
+        sourceName: result.name || attachment.name,
+        detectedFieldCount,
+        pagesProcessed: result.pagesProcessed || 0,
+        warnings: result.warnings || [],
+      })
+
+      if (detectedFieldCount > 0) {
+        toast.success(`OCR imported ${detectedFieldCount} field${detectedFieldCount === 1 ? '' : 's'}. Review before submitting.`)
+      } else {
+        toast('OCR finished, but no form fields were mapped confidently.')
+      }
+    } catch (error) {
+      setOcrState({
+        loading: false,
+        error: error.message || 'OCR extraction failed.',
+        sourceName: attachment.name,
+        detectedFieldCount: 0,
+        pagesProcessed: 0,
+        warnings: [],
+      })
+      toast.error(error.message || 'OCR extraction failed.')
+    }
   }
 
-  /* ─── Submit – existing logic untouched, new fields ride along ─── */
+  async function handleIncomingFiles(selectedFiles, mode = 'replace') {
+    const previousFiles = mode === 'append' ? files : []
+    const previousAttachments = mode === 'append' ? uploadedAttachments : []
+    const acceptedFiles = selectedFiles.filter((file) => file.size <= MAX_ATTACHMENT_SIZE_MB * 1024 * 1024)
+    const rejectedFiles = selectedFiles.filter((file) => file.size > MAX_ATTACHMENT_SIZE_MB * 1024 * 1024)
+
+    if (rejectedFiles.length > 0) {
+      toast.error(`Skipped ${rejectedFiles.length} file${rejectedFiles.length === 1 ? '' : 's'} larger than ${MAX_ATTACHMENT_SIZE_MB} MB.`)
+    }
+
+    if (acceptedFiles.length === 0) {
+      return
+    }
+
+    const nextFiles = mode === 'append' ? [...files, ...acceptedFiles] : acceptedFiles
+    setFiles(nextFiles)
+    setUploadingAttachments(true)
+    setOcrState(emptyOcrState)
+
+    try {
+      const uploaded = await uploadFiles(`test_requests/${draftRequestId}`, acceptedFiles)
+      const nextAttachments = mode === 'append' ? [...uploadedAttachments, ...uploaded] : uploaded
+
+      setUploadedAttachments(nextAttachments)
+
+      const ocrCandidate = [...uploaded].reverse().find((attachment) =>
+        attachment.contentType === 'application/pdf' || attachment.contentType.startsWith('image/'),
+      )
+
+      if (ocrCandidate) {
+        await runOcrForAttachment(ocrCandidate)
+      }
+    } catch (error) {
+      setFiles(previousFiles)
+      setUploadedAttachments(previousAttachments)
+      setOcrState({
+        ...emptyOcrState,
+        error: error.message || 'Attachment upload failed.',
+      })
+      toast.error(error.message || 'Attachment upload failed.')
+    } finally {
+      setUploadingAttachments(false)
+    }
+  }
+
   async function handleSubmit(event) {
     event.preventDefault()
     setSubmitting(true)
+
     try {
-      const requestId = createDraftId('test_requests')
-      const attachments = await uploadFiles(`test_requests/${requestId}`, files)
+      if (uploadingAttachments || ocrState.loading) {
+        throw new Error('Please wait for attachment processing to finish.')
+      }
+
+      if (files.length !== uploadedAttachments.length) {
+        throw new Error('One or more attachments are not uploaded yet. Please reselect the files.')
+      }
+
       await workflowApi.submitTestRequest({
-        requestId,
+        requestId: draftRequestId,
         ...form,
-        attachments,
+        attachments: uploadedAttachments,
       })
+
       toast.success('Test request submitted.')
-      setIsModalOpen(false)
-      setForm(emptyForm)
-      setFiles([])
+      closeModal()
       await loadRequests()
     } catch (error) {
       toast.error(error.message || 'Failed to submit request.')
@@ -106,27 +247,54 @@ export default function TestRequests() {
   }
 
   function openModal() {
+    setDraftRequestId(createDraftId('test_requests'))
     setForm(emptyForm)
     setFiles([])
+    setUploadedAttachments([])
+    setUploadingAttachments(false)
+    setFileDragOver(false)
+    setOcrState(emptyOcrState)
     setIsModalOpen(true)
   }
 
+  function closeModal() {
+    setIsModalOpen(false)
+    setForm(emptyForm)
+    setFiles([])
+    setUploadedAttachments([])
+    setUploadingAttachments(false)
+    setFileDragOver(false)
+    setOcrState(emptyOcrState)
+    setDraftRequestId(createDraftId('test_requests'))
+  }
+
   function set(field) {
-    return (e) => setForm(cur => ({ ...cur, [field]: e.target.value }))
+    return (event) => setForm((current) => ({ ...current, [field]: event.target.value }))
   }
 
   function setCheck(field) {
-    return (e) => setForm(cur => ({ ...cur, [field]: e.target.checked }))
+    return (event) => setForm((current) => ({ ...current, [field]: event.target.checked }))
   }
 
-  /* ─── Row helper ─── */
+  function handleFileInputChange(event) {
+    const selectedFiles = Array.from(event.target.files || [])
+    event.target.value = ''
+    handleIncomingFiles(selectedFiles, 'replace')
+  }
+
+  function handleDrop(event) {
+    event.preventDefault()
+    setFileDragOver(false)
+    handleIncomingFiles(Array.from(event.dataTransfer.files || []), 'append')
+  }
+
   function Row({ label, required, children }) {
     return (
       <div className="form-row-label">
         <div className="frl-label">
-          {label}{required && <span className="req"> *</span>}
-          {required && <span> :</span>}
-          {!required && ' :'}
+          {label}
+          {required && <span className="req"> *</span>}
+          <span> :</span>
         </div>
         <div className="frl-control">{children}</div>
       </div>
@@ -169,7 +337,7 @@ export default function TestRequests() {
               ) : (
                 requests.map((request) => (
                   <tr key={request.id}>
-                    <td>{request.htacNo || '—'}</td>
+                    <td>{request.htacNo || '-'}</td>
                     <td>{request.projectId}</td>
                     <td>{request.testId}</td>
                     <td>{request.testType}</td>
@@ -186,7 +354,6 @@ export default function TestRequests() {
         </div>
       </section>
 
-      {/* ═══════════ MODAL ═══════════ */}
       {isModalOpen ? (
         <div className="modal-backdrop">
           <div className="modal-card-wide">
@@ -194,8 +361,6 @@ export default function TestRequests() {
 
             <form onSubmit={handleSubmit}>
               <div className="modal-body">
-
-                {/* ── Section 1: Core Details ── */}
                 <Row label="HTAC No." required>
                   <input
                     placeholder="Enter HTAC number"
@@ -259,7 +424,7 @@ export default function TestRequests() {
                   />
                 </Row>
 
-                <Row label="Customer ID – Name" required>
+                <Row label="Customer ID - Name" required>
                   <input
                     placeholder="Search customer id or name"
                     value={form.customerIdName}
@@ -291,14 +456,13 @@ export default function TestRequests() {
                     onChange={set('contractReview')}
                     required
                   >
-                    <option value="">— Select One Option —</option>
-                    {CONTRACT_REVIEW_OPTIONS.map(o => (
-                      <option key={o} value={o}>{o}</option>
+                    <option value="">- Select One Option -</option>
+                    {CONTRACT_REVIEW_OPTIONS.map((option) => (
+                      <option key={option} value={option}>{option}</option>
                     ))}
                   </select>
                 </Row>
 
-                {/* ── Section 2: Test Config ── */}
                 <div className="form-section-divider" style={{ marginTop: '16px' }}>
                   <h4>Test Configuration</h4>
                 </div>
@@ -310,16 +474,16 @@ export default function TestRequests() {
                     required
                   >
                     <option value="">Select test type</option>
-                    {TEST_TYPE_OPTIONS.map(t => (
-                      <option key={t} value={t}>{t}</option>
+                    {TEST_TYPE_OPTIONS.map((option) => (
+                      <option key={option} value={option}>{option}</option>
                     ))}
                   </select>
                 </Row>
 
                 <Row label="Priority" required>
                   <select value={form.priority} onChange={set('priority')}>
-                    {PRIORITY_OPTIONS.map(p => (
-                      <option key={p} value={p}>{p}</option>
+                    {PRIORITY_OPTIONS.map((option) => (
+                      <option key={option} value={option}>{option}</option>
                     ))}
                   </select>
                 </Row>
@@ -334,12 +498,31 @@ export default function TestRequests() {
                   />
                 </Row>
 
-                {/* ── Section 3: Work Assignment ── */}
+                <Row label="Physical Lab Required">
+                  <label className="ocr-inline-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={form.physicalLabEnabled}
+                      onChange={setCheck('physicalLabEnabled')}
+                    />
+                    <span>Enable physical lab assignment</span>
+                  </label>
+                </Row>
+
+                {form.physicalLabEnabled ? (
+                  <Row label="Physical Lab">
+                    <select value={form.physicalLab} onChange={set('physicalLab')}>
+                      <option value="">Select lab</option>
+                      {LAB_OPTIONS.map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </select>
+                  </Row>
+                ) : null}
+
                 <div className="form-section-divider" style={{ marginTop: '16px' }}>
                   <h4>Work Assigned To</h4>
                 </div>
-
-
 
                 <Row label="Description">
                   <textarea
@@ -351,37 +534,69 @@ export default function TestRequests() {
                   />
                 </Row>
 
-                {/* ── Section 4: Uploads ── */}
                 <div className="form-section-divider" style={{ marginTop: '16px' }}>
                   <h4>Attachments</h4>
                 </div>
 
+                {(ocrState.loading || ocrState.error || ocrState.sourceName) ? (
+                  <div className={`ocr-summary ${ocrState.error ? 'error' : ''}`}>
+                    <div className="ocr-summary-copy">
+                      <strong>{ocrState.loading ? 'Reading document with OCR...' : `OCR source: ${ocrState.sourceName}`}</strong>
+                      <span>
+                        {ocrState.loading
+                          ? 'The uploaded PDF/image is being analyzed and matched against the request form.'
+                          : `Detected ${ocrState.detectedFieldCount} mapped field${ocrState.detectedFieldCount === 1 ? '' : 's'}${ocrState.pagesProcessed ? ` across ${ocrState.pagesProcessed} page${ocrState.pagesProcessed === 1 ? '' : 's'}` : ''}.`}
+                      </span>
+                      {ocrState.error ? <span>{ocrState.error}</span> : null}
+                      {!ocrState.error && ocrState.warnings.length > 0 ? (
+                        <span>{ocrState.warnings.join(' ')}</span>
+                      ) : null}
+                    </div>
+                    {uploadedAttachments.length > 0 ? (
+                      <button
+                        type="button"
+                        className="button button-secondary"
+                        onClick={() => runOcrForAttachment(uploadedAttachments[uploadedAttachments.length - 1])}
+                        disabled={ocrState.loading || uploadingAttachments}
+                      >
+                        Run OCR Again
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+
                 <div style={{ padding: '12px 0' }}>
-                  <span className="drop-zone-label">Upload Attachment – PDF or Image (Maximum size 10 MB):</span>
+                  <span className="drop-zone-label">Upload Attachment - PDF or Image (Maximum size 10 MB):</span>
                   <div
                     className={`drop-zone ${fileDragOver ? 'drag-over' : ''}`}
                     onClick={() => fileInputRef.current?.click()}
-                    onDragOver={e => { e.preventDefault(); setFileDragOver(true) }}
+                    onDragOver={(event) => { event.preventDefault(); setFileDragOver(true) }}
                     onDragLeave={() => setFileDragOver(false)}
-                    onDrop={e => { setFileDragOver(false); handleDrop(e, setFiles) }}
+                    onDrop={handleDrop}
                   >
                     <input
                       ref={fileInputRef}
                       type="file"
                       accept=".pdf,image/*"
                       multiple
-                      onChange={e => setFiles(Array.from(e.target.files || []))}
+                      onChange={handleFileInputChange}
                     />
                     <FileUp size={28} style={{ marginBottom: '8px', opacity: 0.5 }} />
                     <div>
-                      {files.length > 0
-                        ? files.map(f => f.name).join(', ')
-                        : 'Select or Drop PDF / Image files here'}
+                      {uploadingAttachments
+                        ? 'Uploading attachments and running OCR...'
+                        : files.length > 0
+                          ? files.map((file) => file.name).join(', ')
+                          : 'Select or drop PDF / image files here'}
                     </div>
                   </div>
+                  {uploadedAttachments.length > 0 ? (
+                    <div className="ocr-attachments-meta">
+                      Stored {uploadedAttachments.length} attachment{uploadedAttachments.length === 1 ? '' : 's'} for this draft request.
+                    </div>
+                  ) : null}
                 </div>
 
-                {/* ── Section 5: Final Details ── */}
                 <div className="form-section-divider" style={{ marginTop: '8px' }}>
                   <h4>Additional Information</h4>
                 </div>
@@ -412,17 +627,15 @@ export default function TestRequests() {
                     <option value="Inactive">Inactive</option>
                   </select>
                 </Row>
-
               </div>
 
-              {/* ── Action Bar ── */}
               <div className="modal-action-bar">
                 <button
                   type="submit"
                   name="action"
                   value="save"
                   className="button button-secondary"
-                  disabled={submitting}
+                  disabled={submitting || uploadingAttachments || ocrState.loading}
                 >
                   Save
                 </button>
@@ -431,21 +644,20 @@ export default function TestRequests() {
                   name="action"
                   value="send"
                   className="button button-primary"
-                  disabled={submitting}
+                  disabled={submitting || uploadingAttachments || ocrState.loading}
                 >
                   {submitting ? 'Submitting...' : 'Send Request to Lab'}
                 </button>
                 <button
                   type="button"
                   className="button button-danger"
-                  onClick={() => setIsModalOpen(false)}
+                  onClick={closeModal}
                   disabled={submitting}
                 >
                   Cancel
                 </button>
               </div>
             </form>
-
           </div>
         </div>
       ) : null}

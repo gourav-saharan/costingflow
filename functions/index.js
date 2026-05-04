@@ -141,10 +141,6 @@ async function getUserProfile(uid) {
   }
 
   const profile = snapshot.data();
-  if (profile.status === "Disabled") {
-    throw new functions.https.HttpsError("permission-denied", "This account is disabled.");
-  }
-
   return {
     id: snapshot.id,
     ...profile,
@@ -177,7 +173,6 @@ function claimsFromProfile(profile) {
   return {
     role: profile.role,
     department: profile.department,
-    status: profile.status,
     permissions: profile.permissions || {},
   };
 }
@@ -216,11 +211,318 @@ function sanitizeAttachments(attachments) {
   return ensureArray(attachments || [], "attachments").map((attachment) => ({
     name: ensureNonEmptyString(attachment.name, "attachment.name"),
     url: ensureNonEmptyString(attachment.url, "attachment.url"),
+    bucket: String(attachment.bucket || "").trim() || null,
     fullPath: ensureNonEmptyString(attachment.fullPath, "attachment.fullPath"),
     contentType: String(attachment.contentType || ""),
     size: Number(attachment.size || 0),
     uploadedAt: attachment.uploadedAt || new Date().toISOString(),
   }));
+}
+
+function normalizeOcrText(value) {
+  return String(value || "")
+    .replace(/\r/g, "")
+    .replace(/[–—]/g, "-")
+    .replace(/[•·]/g, " ")
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function normalizeComparable(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function splitDocumentLines(text) {
+  return normalizeOcrText(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function cleanExtractedValue(value) {
+  return String(value || "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[:\-–—\s]+/, "")
+    .replace(/\s+[:\-–—]+$/, "")
+    .trim();
+}
+
+function looksLikeNewFieldLabel(value) {
+  if (!value) {
+    return false;
+  }
+
+  const compact = value.replace(/\s+/g, " ").trim();
+  return /^[A-Z][A-Za-z0-9 /().,&-]{2,50}:?$/.test(compact);
+}
+
+function extractLabeledValue(text, labels, {multiline = false} = {}) {
+  const lines = splitDocumentLines(text);
+  const comparableLabels = labels.map((label) => normalizeComparable(label));
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const normalizedLine = normalizeComparable(line);
+    const matchingLabel = comparableLabels.find((label) => normalizedLine.includes(label));
+    if (!matchingLabel) {
+      continue;
+    }
+
+    let extracted = "";
+    const rawLabel = labels[comparableLabels.indexOf(matchingLabel)];
+    const labelPattern = new RegExp(`${escapeRegExp(rawLabel)}\\s*[:\\-–—]?\\s*(.*)$`, "i");
+    const labelMatch = line.match(labelPattern);
+    if (labelMatch && cleanExtractedValue(labelMatch[1])) {
+      extracted = cleanExtractedValue(labelMatch[1]);
+    } else {
+      const remainder = cleanExtractedValue(line.replace(new RegExp(escapeRegExp(rawLabel), "i"), ""));
+      if (remainder && remainder !== cleanExtractedValue(line)) {
+        extracted = remainder;
+      }
+    }
+
+    if (!multiline) {
+      if (!extracted && lines[index + 1] && !looksLikeNewFieldLabel(lines[index + 1])) {
+        extracted = cleanExtractedValue(lines[index + 1]);
+      }
+      if (extracted) {
+        return extracted;
+      }
+      continue;
+    }
+
+    const chunks = [];
+    if (extracted) {
+      chunks.push(extracted);
+    }
+
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const nextLine = cleanExtractedValue(lines[cursor]);
+      if (!nextLine || looksLikeNewFieldLabel(nextLine)) {
+        break;
+      }
+      chunks.push(nextLine);
+    }
+
+    const combined = cleanExtractedValue(chunks.join(" "));
+    if (combined) {
+      return combined;
+    }
+  }
+
+  return "";
+}
+
+function pickBestOption(value, options) {
+  const normalizedValue = normalizeComparable(value);
+  if (!normalizedValue) {
+    return "";
+  }
+
+  for (const option of options) {
+    const normalizedOption = normalizeComparable(option);
+    if (normalizedValue === normalizedOption || normalizedValue.includes(normalizedOption) || normalizedOption.includes(normalizedValue)) {
+      return option;
+    }
+  }
+
+  const valueTokens = new Set(normalizedValue.split(" ").filter(Boolean));
+  let bestOption = "";
+  let bestScore = 0;
+
+  for (const option of options) {
+    const optionTokens = normalizeComparable(option).split(" ").filter(Boolean);
+    if (!optionTokens.length) {
+      continue;
+    }
+
+    const overlap = optionTokens.filter((token) => valueTokens.has(token)).length;
+    const score = overlap / optionTokens.length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestOption = option;
+    }
+  }
+
+  return bestScore >= 0.5 ? bestOption : "";
+}
+
+function parseDocumentDate(value) {
+  const raw = cleanExtractedValue(value);
+  if (!raw) {
+    return "";
+  }
+
+  const directMatch = raw.match(/\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b/);
+  if (directMatch) {
+    const day = Number(directMatch[1]);
+    const month = Number(directMatch[2]);
+    let year = Number(directMatch[3]);
+    if (year < 100) {
+      year += 2000;
+    }
+    if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+  }
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+
+  return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
+}
+
+function compactSuggestedFields(fields) {
+  return Object.entries(fields).reduce((accumulator, [key, value]) => {
+    const cleaned = typeof value === "string" ? cleanExtractedValue(value) : value;
+    if (cleaned) {
+      accumulator[key] = cleaned;
+    }
+    return accumulator;
+  }, {});
+}
+
+function extractTestRequestFieldsFromText(text) {
+  const suggestions = compactSuggestedFields({
+    htacNo: extractLabeledValue(text, ["HTAC No.", "HTAC No", "HTAC Number"]),
+    dateOfReceipt: parseDocumentDate(extractLabeledValue(text, ["Date of Receipt of Sample", "Date of Receipt", "Receipt Date"])),
+    referenceNo: extractLabeledValue(text, ["Project No. / Reference No.", "Project No / Reference No", "Reference No.", "Reference No", "Project No."]),
+    projectId: extractLabeledValue(text, ["Project ID"]),
+    testId: extractLabeledValue(text, ["Test ID"]),
+    sampleDetails: extractLabeledValue(text, ["Sample Details", "Sample Description"], {multiline: true}),
+    customerCode: extractLabeledValue(text, ["Customer Code"]),
+    customerIdName: extractLabeledValue(text, ["Customer ID - Name", "Customer ID Name", "Customer Name"]),
+    customerGST: extractLabeledValue(text, ["Customer GST Number", "GST Number", "GSTIN"]),
+    originatorReference: extractLabeledValue(text, ["Originator Reference"]),
+    tyreDetails: extractLabeledValue(text, ["Tyre Details", "Tire Details"], {multiline: true}),
+    description: extractLabeledValue(text, ["Description"], {multiline: true}),
+    remarks: extractLabeledValue(text, ["Remarks"], {multiline: true}),
+    paymentDetails: extractLabeledValue(text, ["Payment Details"], {multiline: true}),
+    activeStatus: pickBestOption(extractLabeledValue(text, ["Active / Inactive", "Status"]), ["Active", "Inactive"]),
+    priority: pickBestOption(extractLabeledValue(text, ["Priority"]), ["Low", "Medium", "High", "Critical"]),
+    testType: pickBestOption(extractLabeledValue(text, ["Test Type", "Type of Test"]), [
+      "Durability",
+      "Rolling Resistance",
+      "Traction / Braking",
+      "NVH",
+      "Endurance",
+      "Wet Handling",
+    ]),
+    contractReview: pickBestOption(extractLabeledValue(text, ["Contract Review"]), [
+      "Applicable - Contract Reviewed & Approved",
+      "Not Applicable - Internal Test",
+      "Pending Review",
+    ]),
+    physicalLab: pickBestOption(extractLabeledValue(text, ["Physical Lab", "Lab"]), [
+      "Physical Lab - Mysuru (RPSCOE)",
+      "Physical Lab - Indore (NATRAX)",
+      "Virtual Simulation Lab",
+    ]),
+  });
+
+  if (suggestions.physicalLab) {
+    suggestions.physicalLabEnabled = suggestions.physicalLab !== "Virtual Simulation Lab";
+  }
+
+  return suggestions;
+}
+
+async function getServiceAccessToken() {
+  const credential = admin.app().options.credential;
+  if (!credential || typeof credential.getAccessToken !== "function") {
+    throw new Error("Application default credentials are not available for OCR.");
+  }
+
+  const tokenResponse = await credential.getAccessToken();
+  return tokenResponse.access_token;
+}
+
+async function callVisionApi(endpoint, body) {
+  const accessToken = await getServiceAccessToken();
+  const projectId = process.env.GCLOUD_PROJECT || admin.app().options.projectId;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json; charset=utf-8",
+      ...(projectId ? {"x-goog-user-project": projectId} : {}),
+    },
+    body: JSON.stringify(body),
+  });
+
+  const payload = await response.json();
+  if (!response.ok) {
+    const message = payload && payload.error && payload.error.message
+      ? payload.error.message
+      : "Cloud Vision OCR request failed.";
+    throw new Error(message);
+  }
+
+  return payload;
+}
+
+async function runVisionOcrForDocument({bucket, fullPath, contentType}) {
+  const gcsUri = `gs://${bucket}/${fullPath}`;
+
+  if (contentType === "application/pdf") {
+    const result = await callVisionApi("https://vision.googleapis.com/v1/files:annotate", {
+      requests: [
+        {
+          inputConfig: {
+            gcsSource: {uri: gcsUri},
+            mimeType: contentType,
+          },
+          features: [{type: "DOCUMENT_TEXT_DETECTION"}],
+          pages: [1, 2, 3, 4, 5],
+        },
+      ],
+    });
+
+    const pageResponses = (((result.responses || [])[0] || {}).responses || []);
+    const text = pageResponses
+      .map((page) => (((page || {}).fullTextAnnotation || {}).text || "").trim())
+      .filter(Boolean)
+      .join("\n\n");
+
+    return {
+      text,
+      pagesProcessed: pageResponses.length,
+    };
+  }
+
+  if (String(contentType || "").startsWith("image/")) {
+    const result = await callVisionApi("https://vision.googleapis.com/v1/images:annotate", {
+      requests: [
+        {
+          image: {
+            source: {
+              imageUri: gcsUri,
+            },
+          },
+          features: [{type: "DOCUMENT_TEXT_DETECTION"}],
+        },
+      ],
+    });
+
+    const response = (result.responses || [])[0] || {};
+    return {
+      text: (((response || {}).fullTextAnnotation || {}).text || "").trim(),
+      pagesProcessed: response.fullTextAnnotation ? 1 : 0,
+    };
+  }
+
+  throw new functions.https.HttpsError("invalid-argument", "Only PDF and image files are supported for OCR.");
 }
 
 function calculateTotalCost(lineItems) {
@@ -687,6 +989,79 @@ exports.updateUserAccess = functions.https.onCall(async (data, context) => {
   return { success: true };
 });
 
+exports.extractTestRequestFromDocument = functions.https.onCall(async (data, context) => {
+  assertAuthenticated(context);
+  assertAllowedNetwork(context.rawRequest);
+  const actor = await getUserProfile(context.auth.uid);
+  requireRoles(actor, [ROLES.HOD, ROLES.PDC]);
+  requirePermission(actor, "submitRequests");
+
+  const bucket = ensureNonEmptyString(data.bucket, "bucket");
+  const fullPath = ensureNonEmptyString(data.fullPath, "fullPath");
+  const contentType = ensureNonEmptyString(data.contentType, "contentType");
+  const fileName = ensureNonEmptyString(data.name || fullPath.split("/").pop() || "attachment", "name");
+
+  try {
+    const {text, pagesProcessed} = await runVisionOcrForDocument({
+      bucket,
+      fullPath,
+      contentType,
+    });
+    const normalizedText = normalizeOcrText(text);
+    if (!normalizedText) {
+      return {
+        success: true,
+        name: fileName,
+        pagesProcessed,
+        text: "",
+        suggestions: {},
+        warnings: ["No readable text was detected in the uploaded document."],
+      };
+    }
+
+    const suggestions = extractTestRequestFieldsFromText(normalizedText);
+    const missingRequiredFields = [
+      "htacNo",
+      "dateOfReceipt",
+      "projectId",
+      "testId",
+      "sampleDetails",
+      "customerCode",
+      "customerIdName",
+      "originatorReference",
+      "testType",
+      "priority",
+      "tyreDetails",
+    ].filter((fieldName) => !suggestions[fieldName]);
+
+    return {
+      success: true,
+      name: fileName,
+      pagesProcessed,
+      text: normalizedText,
+      suggestions,
+      warnings: missingRequiredFields.length
+        ? [`OCR could not confidently map: ${missingRequiredFields.join(", ")}`]
+        : [],
+    };
+  } catch (error) {
+    console.error("extractTestRequestFromDocument error:", error);
+    if (error instanceof functions.https.HttpsError) {
+      throw error;
+    }
+
+    const message = String(error.message || "");
+    if (message.includes("SERVICE_DISABLED") || message.includes("Cloud Vision API has not been used")) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "OCR is not available until the Cloud Vision API is enabled for this Firebase project.",
+      );
+    }
+
+    throw new functions.https.HttpsError("internal", message || "OCR extraction failed.");
+  }
+});
+
 exports.submitTestRequest = functions.https.onCall(async (data, context) => {
   assertAuthenticated(context);
   const clientIp = assertAllowedNetwork(context.rawRequest);
@@ -702,11 +1077,26 @@ exports.submitTestRequest = functions.https.onCall(async (data, context) => {
   }
 
   const payload = {
+    htacNo: String(data.htacNo || "").trim(),
+    dateOfReceipt: String(data.dateOfReceipt || "").trim(),
+    referenceNo: String(data.referenceNo || "").trim(),
     projectId: ensureNonEmptyString(data.projectId, "projectId"),
     testId: ensureNonEmptyString(data.testId, "testId"),
+    sampleDetails: ensureNonEmptyString(data.sampleDetails, "sampleDetails"),
+    customerCode: ensureNonEmptyString(data.customerCode, "customerCode"),
+    customerIdName: ensureNonEmptyString(data.customerIdName, "customerIdName"),
+    customerGST: String(data.customerGST || "").trim(),
+    originatorReference: ensureNonEmptyString(data.originatorReference, "originatorReference"),
+    contractReview: ensureNonEmptyString(data.contractReview, "contractReview"),
+    physicalLabEnabled: Boolean(data.physicalLabEnabled),
+    physicalLab: String(data.physicalLab || "").trim(),
     tyreDetails: ensureNonEmptyString(data.tyreDetails, "tyreDetails"),
     testType: ensureNonEmptyString(data.testType, "testType"),
     priority: ensureNonEmptyString(data.priority, "priority"),
+    description: String(data.description || "").trim(),
+    remarks: String(data.remarks || "").trim(),
+    paymentDetails: String(data.paymentDetails || "").trim(),
+    activeStatus: data.activeStatus === "Inactive" ? "Inactive" : "Active",
     attachments: sanitizeAttachments(data.attachments),
     status: STATUS.PENDING,
     activeCostingId: null,
@@ -729,6 +1119,7 @@ exports.submitTestRequest = functions.https.onCall(async (data, context) => {
     entityId: requestId,
     fieldChanged: "request",
     newValue: {
+      htacNo: payload.htacNo,
       projectId: payload.projectId,
       testId: payload.testId,
       status: payload.status,

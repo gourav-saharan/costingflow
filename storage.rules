@@ -2,7 +2,7 @@ rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
     function isSignedIn() {
-      return request.auth != null && request.auth.token.status == 'Active';
+      return request.auth != null;
     }
 
     function isRole(role) {
@@ -18,6 +18,23 @@ service firebase.storage {
         );
     }
 
+    function canViewCosting() {
+      return isSignedIn()
+        && (
+          request.auth.token.role == 'HOD'
+          || request.auth.token.permissions.viewCosting == true
+          || request.auth.token.permissions.editCosting == true
+        );
+    }
+
+    function canEditCosting() {
+      return isSignedIn()
+        && (
+          request.auth.token.role == 'HOD'
+          || request.auth.token.permissions.editCosting == true
+        );
+    }
+
     match /test_requests/{requestId}/{allPaths=**} {
       allow read: if isSignedIn();
       allow write: if isRole('PDC') || isRole('HOD');
@@ -26,6 +43,11 @@ service firebase.storage {
     match /reports/{assignmentId}/{allPaths=**} {
       allow read: if isSignedIn();
       allow write: if isRole('Engineer') || isRole('HOD') || isManagement();
+    }
+
+    match /costing_imports/{docId}/{allPaths=**} {
+      allow read: if canViewCosting();
+      allow write: if canEditCosting();
     }
 
     match /{allPaths=**} {

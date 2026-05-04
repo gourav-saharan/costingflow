@@ -29,6 +29,7 @@ export async function uploadFiles(basePath, files) {
     uploads.push({
       name: file.name,
       url,
+      bucket: snapshot.ref.bucket,
       fullPath: storagePath,
       contentType: file.type,
       size: file.size,
@@ -42,6 +43,7 @@ export async function uploadFiles(basePath, files) {
 export const workflowApi = {
   createUser: (payload) => invoke('createUser', payload),
   updateUserAccess: (payload) => invoke('updateUserAccess', payload),
+  extractTestRequestFromDocument: (payload) => invoke('extractTestRequestFromDocument', payload),
   submitTestRequest: (payload) => invoke('submitTestRequest', payload),
   saveCosting: (payload) => invoke('saveCosting', payload),
   assignTest: (payload) => invoke('assignTest', payload),

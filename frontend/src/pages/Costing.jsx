@@ -1,24 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { collection, doc, getDoc, getDocs, onSnapshot, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore'
+import { getDownloadURL, ref, uploadBytes } from 'firebase/storage'
 import toast from 'react-hot-toast'
 import * as XLSX from 'xlsx'
 import {
-  AlertCircle,
   Download,
   Eye,
-  EyeOff,
   FileSpreadsheet,
-  Filter,
   Loader,
   Maximize2,
   Plus,
-  RefreshCw,
   Save,
-  Search,
   Upload,
   X,
 } from 'lucide-react'
-import { db } from '../firebase'
+import { db, storage } from '../firebase'
 import { formatCurrency, formatDateTime } from '../lib/format'
 import { ROLES } from '../lib/constants'
 import { canEditCosting } from '../lib/permissions'
@@ -27,7 +23,6 @@ import {
   PAGE_SIZE_OPTIONS,
   SHEET_CONFIG,
   SHEET_KEYS,
-  STATUS_FILTER_OPTIONS,
   buildEmptyWorkbook,
   buildSheetSummaryEntry,
   calculateSheetTotal,
@@ -39,6 +34,16 @@ import {
 
 const BATCH_LIMIT = 450
 const STATUS_OPTIONS = ['Done', 'In Progress', 'Pending', 'Not Started', '']
+const INITIAL_METADATA = {
+  exists: false,
+  importMeta: null,
+  sheetSummary: {},
+  updatedAt: null,
+  updatedBy: '',
+  updatedByEmail: '',
+  version: 0,
+  hasLegacyData: false,
+}
 
 const STATUS_STYLES = {
   Done: { bg: '#dcfce7', color: '#15803d', label: 'Done' },
@@ -50,6 +55,19 @@ const STATUS_STYLES = {
 
 function getChunkId(index) {
   return `chunk-${String(index + 1).padStart(4, '0')}`
+}
+
+function getSpreadsheetColumnLabel(index) {
+  let label = ''
+  let current = index
+
+  while (current > 0) {
+    const remainder = (current - 1) % 26
+    label = String.fromCharCode(65 + remainder) + label
+    current = Math.floor((current - 1) / 26)
+  }
+
+  return label || 'A'
 }
 
 function getStatusStyle(value) {
@@ -106,6 +124,35 @@ function buildActor(profile, currentUser) {
     name: profile?.name || 'Unknown User',
     email: currentUser?.email || profile?.email || 'unknown@local',
   }
+}
+
+function sanitizeStorageFileName(fileName) {
+  return String(fileName || 'workbook.xlsx').replace(/[^a-zA-Z0-9._-]/g, '_')
+}
+
+async function uploadImportWorkbook(file, importMeta) {
+  const storagePath = `costing_imports/v1/${Date.now()}-${sanitizeStorageFileName(file.name)}`
+  const fileRef = ref(storage, storagePath)
+  const snapshot = await uploadBytes(fileRef, file, {
+    contentType: file.type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    customMetadata: {
+      importedAt: importMeta.importedAt,
+      importedBy: importMeta.importedByEmail || 'unknown@local',
+    },
+  })
+  const downloadURL = await getDownloadURL(snapshot.ref)
+
+  return {
+    storagePath,
+    downloadURL,
+    contentType: file.type || 'application/octet-stream',
+    fileSize: file.size || 0,
+    uploadedAt: new Date().toISOString(),
+  }
+}
+
+function isStoragePermissionError(error) {
+  return error?.code === 'storage/unauthorized' || error?.code === 'storage/unauthenticated'
 }
 
 async function commitOperations(operations) {
@@ -318,48 +365,36 @@ function buildFillValue(baseValue, offset, column) {
 }
 
 export default function Costing() {
-  const { currentUser, profile } = useAuth()
+  const { currentUser, profile, loading: authLoading } = useAuth()
   const canEdit = canEditCosting(profile)
   const isHod = profile?.role === ROLES.HOD
+  const hasRemoteSession = Boolean(currentUser?.uid && !currentUser?.isBootstrap && !currentUser?.isLocalUser)
 
   const [activeSheet, setActiveSheet] = useState(SHEET_KEYS[0])
   const [sheetData, setSheetData] = useState(() => buildEmptyWorkbook())
-  const [metadata, setMetadata] = useState({
-    exists: false,
-    importMeta: null,
-    sheetSummary: {},
-    updatedAt: null,
-    updatedBy: '',
-    updatedByEmail: '',
-    version: 0,
-    hasLegacyData: false,
-  })
+  const [metadata, setMetadata] = useState(INITIAL_METADATA)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [dirty, setDirty] = useState(false)
   const [stagedImport, setStagedImport] = useState(null)
-  const [searchTerm, setSearchTerm] = useState('')
-  const [filterStatus, setFilterStatus] = useState('')
-  const [filterType, setFilterType] = useState('')
-  const [showFilters, setShowFilters] = useState(false)
-  const [hiddenCols, setHiddenCols] = useState({})
-  const [showColManager, setShowColManager] = useState(false)
+  const [stagedImportFile, setStagedImportFile] = useState(null)
+  const [showImportBanner, setShowImportBanner] = useState(false)
   const [editingCell, setEditingCell] = useState(null)
   const [selectedCell, setSelectedCell] = useState(null)
   const [fillDrag, setFillDrag] = useState(null)
   const [selectedDetailRowIndex, setSelectedDetailRowIndex] = useState(null)
   const [detailDraft, setDetailDraft] = useState(null)
   const [detailDirty, setDetailDirty] = useState(false)
-  const [pageSize, setPageSize] = useState(PAGE_SIZE_OPTIONS[1])
   const [page, setPage] = useState(1)
+  const pageSize = PAGE_SIZE_OPTIONS[1]
 
+  const pageRef = useRef(null)
   const fileInputRef = useRef(null)
   const tableWrapperRef = useRef(null)
   const fillDragRef = useRef(null)
 
   const currentCols = SHEET_CONFIG[activeSheet].columns
   const sheetColor = SHEET_CONFIG[activeSheet].color
-  const sheetBgLight = SHEET_CONFIG[activeSheet].tint
 
   const hydrateFromSnapshot = useCallback(async (snapshot) => {
     const nextState = await buildWorkbookStateFromSnapshot(snapshot)
@@ -367,104 +402,98 @@ export default function Costing() {
     setMetadata(nextState.metadata)
     setDirty(false)
     setStagedImport(null)
+    setStagedImportFile(null)
+    setShowImportBanner(false)
   }, [])
 
   useEffect(() => {
     let active = true
 
-    const unsubscribe = onSnapshot(
-      doc(db, 'costing_master', 'v1'),
-      async (snapshot) => {
+    async function loadWorkbook() {
+      if (authLoading) {
+        return
+      }
+
+      if (!hasRemoteSession || !profile) {
+        setSheetData(buildEmptyWorkbook())
+        setMetadata(INITIAL_METADATA)
+        setDirty(false)
+        setStagedImport(null)
+        setStagedImportFile(null)
+        setShowImportBanner(false)
+        setLoading(false)
+        return
+      }
+
+      setLoading(true)
+
+      try {
+        const snapshot = await getDoc(doc(db, 'costing_master', 'v1'))
         if (!active) {
           return
         }
 
-        setLoading(true)
-
-        try {
-          if (!active) {
-            return
-          }
-
-          await hydrateFromSnapshot(snapshot)
-        } catch (error) {
-          console.error(error)
-          if (active) {
-            toast.error('Failed to load costing workbook.')
-          }
-        } finally {
-          if (active) {
-            setLoading(false)
-          }
-        }
-      },
-      (error) => {
+        await hydrateFromSnapshot(snapshot)
+      } catch (error) {
         console.error(error)
         if (active) {
-          toast.error('Failed to subscribe to costing workbook.')
+          toast.error('Failed to load costing workbook.')
+        }
+      } finally {
+        if (active) {
           setLoading(false)
         }
-      },
-    )
+      }
+    }
+
+    loadWorkbook()
 
     return () => {
       active = false
-      unsubscribe()
     }
-  }, [hydrateFromSnapshot])
+  }, [authLoading, hasRemoteSession, hydrateFromSnapshot, profile])
+
+  useEffect(() => {
+    const shell = pageRef.current?.closest('.page-shell')
+    if (!shell) {
+      return undefined
+    }
+
+    shell.classList.add('page-shell-costing')
+
+    return () => {
+      shell.classList.remove('page-shell-costing')
+    }
+  }, [])
 
   useEffect(() => {
     setPage(1)
     setEditingCell(null)
     setSelectedCell(null)
     setSelectedDetailRowIndex(null)
-  }, [activeSheet, searchTerm, filterStatus, filterType, pageSize])
+  }, [activeSheet])
 
-  const filteredRows = useMemo(() => {
-    let rows = (sheetData[activeSheet] || []).map((row, sourceIndex) => ({ ...row, __sourceIndex: sourceIndex }))
-
-    if (searchTerm) {
-      const query = searchTerm.toLowerCase()
-      rows = rows.filter((row) => Object.values(row).some((value) => String(value).toLowerCase().includes(query)))
-    }
-
-    if (filterStatus) {
-      rows = rows.filter((row) => {
-        const source = row.finalStatus || row.testStatus || row.status || row.reportCosting || ''
-        return getStatusStyle(source).label.toLowerCase() === filterStatus.toLowerCase()
-      })
-    }
-
-    if (filterType) {
-      rows = rows.filter((row) => String(row.type || '').toLowerCase() === filterType.toLowerCase())
-    }
-
-    return rows
-  }, [sheetData, activeSheet, searchTerm, filterStatus, filterType])
+  const filteredRows = useMemo(
+    () => (sheetData[activeSheet] || []).map((row, sourceIndex) => ({ ...row, __sourceIndex: sourceIndex })),
+    [sheetData, activeSheet],
+  )
 
   const stats = useMemo(() => {
     const rows = sheetData[activeSheet] || []
-    const totalCost = rows.reduce((sum, row) => sum + (Number(row.costing) || 0), 0)
-    const doneCount = rows.filter((row) => String(row.finalStatus || row.testStatus || row.status || '').toLowerCase() === 'done').length
-    const pendingCount = rows.filter((row) => String(row.finalStatus || row.testStatus || row.status || '').toLowerCase() === 'pending').length
-
-    return {
-      total: rows.length,
-      totalCost,
-      doneCount,
-      pendingCount,
-    }
+    return { totalCost: calculateSheetTotal(rows) }
   }, [sheetData, activeSheet])
 
-  const visibleCols = useMemo(
-    () => currentCols.filter((column) => !hiddenCols[`${activeSheet}:${column.key}`]),
-    [activeSheet, currentCols, hiddenCols],
-  )
+  const visibleCols = currentCols
 
   const pageCount = Math.max(1, Math.ceil(filteredRows.length / pageSize))
   const currentPage = Math.min(page, pageCount)
   const pageStartIndex = (currentPage - 1) * pageSize
   const pageRows = filteredRows.slice(pageStartIndex, pageStartIndex + pageSize)
+  const selectedColumnIndex = selectedCell ? visibleCols.findIndex((column) => column.key === selectedCell.col) : -1
+  const selectedCellValue = selectedCell ? (sheetData[activeSheet] || [])[selectedCell.row]?.[selectedCell.col] ?? '' : ''
+  const selectedCellRef = selectedCell && selectedColumnIndex >= 0
+    ? `${getSpreadsheetColumnLabel(selectedColumnIndex + 1)}${selectedCell.row + 2}`
+    : 'A2'
   const selectedDetailRow = selectedDetailRowIndex === null ? null : (sheetData[activeSheet] || [])[selectedDetailRowIndex] || null
   const detailValues = detailDraft || selectedDetailRow
 
@@ -593,20 +622,23 @@ export default function Costing() {
       setSheetData(parsed.sheets)
       setDirty(true)
       setActiveSheet(SHEET_KEYS[0])
-      setSearchTerm('')
-      setFilterStatus('')
-      setFilterType('')
       setSelectedDetailRowIndex(null)
       setEditingCell(null)
-      setStagedImport({
+      const nextImportMeta = {
         sourceFileName: file.name,
         importedAt: new Date().toISOString(),
         importedByName: profile?.name || 'Unknown User',
         importedByEmail: currentUser?.email || profile?.email || 'unknown@local',
+        fileSize: file.size || 0,
+        contentType: file.type || 'application/octet-stream',
         totalRows: SHEET_KEYS.reduce((sum, sheetKey) => sum + Number(parsed.sheetSummary[sheetKey]?.rowCount || 0), 0),
         totalCost: SHEET_KEYS.reduce((sum, sheetKey) => sum + Number(parsed.sheetSummary[sheetKey]?.totalCost || 0), 0),
         extraSheets: parsed.extraSheets,
-      })
+      }
+
+      setStagedImport(nextImportMeta)
+      setStagedImportFile(file)
+      setShowImportBanner(true)
 
       toast.success(`Imported ${file.name} successfully.`)
       if (parsed.extraSheets.length > 0) {
@@ -646,6 +678,31 @@ export default function Costing() {
         accumulator[sheetKey] = buildSheetSummaryEntry(sheetKey, sheetData[sheetKey] || [])
         return accumulator
       }, {})
+      let importMetaToSave = stagedImport || metadata.importMeta || null
+      let importUploadWarning = ''
+
+      if (stagedImport && stagedImportFile) {
+        try {
+          const uploadedFile = await uploadImportWorkbook(stagedImportFile, stagedImport)
+          importMetaToSave = {
+            ...stagedImport,
+            ...uploadedFile,
+          }
+        } catch (error) {
+          if (!isStoragePermissionError(error)) {
+            throw error
+          }
+
+          console.warn('Imported workbook could not be archived in Firebase Storage.', error)
+          importUploadWarning = 'Workbook data saved, but the original Excel file could not be archived because Storage access is not configured for this account.'
+          importMetaToSave = {
+            ...stagedImport,
+            uploadSkipped: true,
+            uploadErrorCode: error.code || 'storage/unauthorized',
+            uploadErrorMessage: error.message || 'Storage upload was denied.',
+          }
+        }
+      }
 
       await commitOperations(buildWorkbookOperations(sheetData, metadata.sheetSummary, actor))
 
@@ -654,7 +711,7 @@ export default function Costing() {
         {
           version: 2,
           sheetSummary: nextSummary,
-          importMeta: stagedImport || metadata.importMeta || null,
+          importMeta: importMetaToSave,
           updatedAt: serverTimestamp(),
           updatedBy: actor.name,
           updatedByEmail: actor.email,
@@ -662,15 +719,14 @@ export default function Costing() {
         { merge: true },
       )
 
-      setDirty(false)
-      if (stagedImport) {
-        setMetadata((current) => ({
-          ...current,
-          importMeta: stagedImport,
-        }))
-        setStagedImport(null)
+      const latestSnapshot = await getDoc(doc(db, 'costing_master', 'v1'))
+      await hydrateFromSnapshot(latestSnapshot)
+      if (importUploadWarning) {
+        toast.success('Costing workbook saved successfully.')
+        toast.error(importUploadWarning, { duration: 6000 })
+      } else {
+        toast.success('Costing workbook saved successfully.')
       }
-      toast.success('Costing workbook saved successfully.')
     } catch (error) {
       console.error(error)
       toast.error(`Failed to save workbook: ${error.message}`)
@@ -685,13 +741,6 @@ export default function Costing() {
     }
 
     fileInputRef.current?.click()
-  }
-
-  function toggleCol(columnKey) {
-    setHiddenCols((current) => ({
-      ...current,
-      [`${activeSheet}:${columnKey}`]: !current[`${activeSheet}:${columnKey}`],
-    }))
   }
 
   function updateDetailDraft(columnKey, value) {
@@ -728,26 +777,6 @@ export default function Costing() {
 
     setDetailDirty(false)
     toast.success('Entry details updated.')
-  }
-
-  async function handleRefresh() {
-    if (dirty) {
-      toast.error('Save or discard your current changes before reloading.')
-      return
-    }
-
-    setLoading(true)
-
-    try {
-      const snapshot = await getDoc(doc(db, 'costing_master', 'v1'))
-      await hydrateFromSnapshot(snapshot)
-      toast.success('Costing workbook reloaded.')
-    } catch (error) {
-      console.error(error)
-      toast.error('Failed to reload costing workbook.')
-    } finally {
-      setLoading(false)
-    }
   }
 
   function handleGridPaste(event) {
@@ -875,6 +904,20 @@ export default function Costing() {
     }
   }
 
+  if (!authLoading && (!currentUser || !profile || !hasRemoteSession)) {
+    return (
+      <div className="page" style={{ height: 'calc(100vh - 78px)', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#ffffff', padding: 0 }}>
+        <div style={{ maxWidth: 420, textAlign: 'center', color: '#475569', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <FileSpreadsheet size={32} color="#94a3b8" style={{ alignSelf: 'center' }} />
+          <p style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: '#0f172a' }}>Sign in to open the costing workbook.</p>
+          <p style={{ margin: 0, fontSize: '0.85rem', lineHeight: 1.5 }}>
+            This page only loads after a real Firebase-backed login. Local placeholder sessions cannot read Firestore data.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
   if (loading) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '60vh', flexDirection: 'column', gap: 16 }}>
@@ -885,311 +928,75 @@ export default function Costing() {
   }
 
   return (
-    <div className="page" style={{ height: 'calc(100vh - 78px)', display: 'flex', flexDirection: 'column', gap: 0, overflow: 'hidden', width: '100%', maxWidth: '100%', minWidth: 0 }}>
-      <div style={{ padding: '6px 8px 0', flexShrink: 0, minWidth: 0, maxWidth: '100%', width: '100%', overflowX: 'clip', boxSizing: 'border-box' }}>
-        <div className="page-header" style={{ marginBottom: 6, minWidth: 0, maxWidth: '100%', width: '100%', overflow: 'hidden', boxSizing: 'border-box', gap: 12 }}>
-          <div style={{ minWidth: 0, maxWidth: '100%', overflow: 'hidden' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', minWidth: 0, maxWidth: '100%' }}>
-              <FileSpreadsheet size={22} color={sheetColor} />
-              <h1 style={{ margin: 0, fontSize: '1.15rem', fontWeight: 700, lineHeight: 1.1 }}>Costing Register</h1>
-              <span
-                style={{
-                  background: sheetBgLight,
-                  color: sheetColor,
-                  fontSize: '0.62rem',
-                  fontWeight: 800,
-                  letterSpacing: '0.08em',
-                  padding: '2px 9px',
-                  borderRadius: 20,
-                  border: `1px solid ${sheetColor}33`,
-                }}
-              >
-                MASTER WORKBOOK / MULTI SHEET
-              </span>
-              {dirty ? (
-                <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: '#d97706', fontSize: '0.68rem', fontWeight: 700 }}>
-                  <AlertCircle size={13} />
-                  Unsaved changes
-                </span>
-              ) : null}
+    <div ref={pageRef} className="page" style={{ height: 'calc(100vh - 78px)', display: 'flex', flexDirection: 'column', gap: 0, overflow: 'hidden', width: '100%', maxWidth: '100%', minWidth: 0, background: '#ffffff', padding: '0' }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: '#fff', border: '1px solid #dfe5ec', borderRadius: 0, overflow: 'hidden', boxShadow: 'none', minWidth: 0 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '0 10px', minHeight: 34, borderBottom: '1px solid #eceff3', background: '#ffffff', flexShrink: 0, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+              <FileSpreadsheet size={15} color={sheetColor} />
+              <span style={{ fontSize: '0.78rem', fontWeight: 800, color: '#111827', whiteSpace: 'nowrap' }}>CostingSheet</span>
             </div>
-            {metadata.importMeta || stagedImport ? (
-              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 4, fontSize: '0.68rem', color: '#475569', minWidth: 0, maxWidth: '100%', overflow: 'hidden' }}>
-                <span><strong>Source:</strong> {(stagedImport || metadata.importMeta)?.sourceFileName || 'NA'}</span>
-                <span><strong>Imported By:</strong> {(stagedImport || metadata.importMeta)?.importedByName || metadata.updatedBy || 'NA'}</span>
-                <span><strong>Imported At:</strong> {(stagedImport || metadata.importMeta)?.importedAt ? formatDateTime((stagedImport || metadata.importMeta).importedAt) : 'NA'}</span>
-              </div>
-            ) : null}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0, overflow: 'auto' }}>
+              {['File', 'Edit', 'View', 'Insert', 'Format', 'Data'].map((item) => (
+                <button
+                  key={item}
+                  type="button"
+                  style={{ border: 'none', background: 'transparent', padding: 0, color: '#6b7280', fontSize: '0.64rem', fontWeight: 700, whiteSpace: 'nowrap' }}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
           </div>
 
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0, flexWrap: 'wrap', minWidth: 0, maxWidth: '100%' }}>
+          <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <input ref={fileInputRef} type="file" accept=".xlsx,.xls" onChange={handleImport} style={{ display: 'none' }} />
             {isHod ? (
-              <button className="button button-secondary" onClick={triggerImport} style={{ gap: 6, fontSize: '0.72rem', padding: '8px 12px' }}>
-                <Upload size={14} />
-                Import Excel
+              <button className="button button-secondary" onClick={triggerImport} style={{ gap: 5, fontSize: '0.62rem', padding: '0 10px', minHeight: 24, borderRadius: 2, background: '#f3f4f6', boxShadow: 'none' }}>
+                <Upload size={12} />
+                Import
               </button>
             ) : null}
-            <button className="button button-secondary" onClick={handleExport} style={{ gap: 6, fontSize: '0.72rem', padding: '8px 12px' }}>
-              <Download size={14} />
+            <button className="button button-secondary" onClick={handleExport} style={{ gap: 5, fontSize: '0.62rem', padding: '0 10px', minHeight: 24, borderRadius: 2, background: '#f3f4f6', boxShadow: 'none' }}>
+              <Download size={12} />
               Export
-            </button>
-            <button className="button button-secondary" onClick={handleRefresh} style={{ gap: 6, fontSize: '0.72rem', padding: '8px 12px' }}>
-              <RefreshCw size={14} />
-              Refresh
             </button>
             <button
               className={`button ${dirty ? 'button-primary' : 'button-secondary'}`}
               onClick={handleSave}
               disabled={saving}
-              style={{ gap: 6, fontSize: '0.72rem', padding: '8px 12px' }}
+              style={{ gap: 5, fontSize: '0.62rem', padding: '0 10px', minHeight: 24, borderRadius: 2, boxShadow: 'none', background: dirty ? '#16a34a' : '#f3f4f6', color: dirty ? '#fff' : '#111827' }}
             >
-              {saving ? <Loader size={14} style={{ animation: 'spin 1s linear infinite' }} /> : <Save size={14} />}
+              {saving ? <Loader size={12} style={{ animation: 'spin 1s linear infinite' }} /> : <Save size={12} />}
               {saving ? 'Saving...' : 'Save'}
             </button>
           </div>
         </div>
 
-        {stagedImport ? (
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              gap: 16,
-              marginBottom: 8,
-              padding: '8px 12px',
-              borderRadius: 10,
-              background: '#eff6ff',
-              border: '1px solid #bfdbfe',
-              color: '#1d4ed8',
-              width: '100%',
-              maxWidth: '100%',
-              minWidth: 0,
-              overflow: 'hidden',
-              boxSizing: 'border-box',
-            }}
-          >
-            <div style={{ fontSize: '0.72rem', lineHeight: 1.45, minWidth: 0, overflowWrap: 'anywhere' }}>
-              <strong>{stagedImport.sourceFileName}</strong> is staged locally with {stagedImport.totalRows.toLocaleString('en-IN')} rows and {formatCurrency(stagedImport.totalCost)} total costing.
-              {stagedImport.extraSheets?.length ? ` ${stagedImport.extraSheets.length} extra workbook tab(s) were ignored.` : ''}
-            </div>
-            <button
-              type="button"
-              onClick={() => setStagedImport(null)}
-              style={{ background: 'transparent', border: 'none', color: '#1d4ed8', cursor: 'pointer', fontWeight: 700 }}
-            >
-              Dismiss
-            </button>
+        <div style={{ display: 'grid', gridTemplateColumns: '72px minmax(0, 1fr) auto', gap: 6, alignItems: 'center', padding: '4px 10px', borderBottom: '1px solid #eceff3', background: '#fafbfc', flexShrink: 0, minWidth: 0 }}>
+          <div style={{ minWidth: 72, padding: '4px 8px', borderRadius: 0, border: '1px solid #e5e7eb', background: '#fff', fontSize: '0.66rem', fontWeight: 700, color: '#334155', textAlign: 'center' }}>
+            {selectedCellRef}
           </div>
-        ) : null}
-      </div>
-
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: '#fff', border: '1px solid var(--ghost-border)', borderRadius: 0, margin: '0 0 0', overflow: 'hidden', boxShadow: 'none', minWidth: 0 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'stretch', borderBottom: '1px solid var(--ghost-border)', background: '#f8fafc', flexShrink: 0, minWidth: 0, overflow: 'hidden' }}>
-          <div style={{ display: 'flex', overflow: 'auto', minWidth: 0 }}>
-            {SHEET_KEYS.map((sheetKey) => {
-              const config = SHEET_CONFIG[sheetKey]
-              const isActive = activeSheet === sheetKey
-              const count = (sheetData[sheetKey] || []).length
-
-              return (
-                <button
-                  key={sheetKey}
-                  onClick={() => setActiveSheet(sheetKey)}
-                  style={{
-                    padding: '10px 16px',
-                    border: 'none',
-                    borderBottom: isActive ? `3px solid ${config.color}` : '3px solid transparent',
-                    background: isActive ? '#fff' : 'transparent',
-                    color: isActive ? config.color : 'var(--muted)',
-                    fontWeight: isActive ? 800 : 600,
-                    fontSize: '0.68rem',
-                    letterSpacing: '0.04em',
-                    cursor: 'pointer',
-                    whiteSpace: 'nowrap',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    transition: 'all 0.15s ease',
-                  }}
-                >
-                  <span>{config.label.toUpperCase()}</span>
-                  <span
-                    style={{
-                      background: isActive ? config.color : '#e2e8f0',
-                      color: isActive ? '#fff' : 'var(--muted)',
-                      fontSize: '0.58rem',
-                      fontWeight: 800,
-                      padding: '1px 7px',
-                      borderRadius: 20,
-                      minWidth: 22,
-                      textAlign: 'center',
-                    }}
-                  >
-                    {count}
-                  </span>
-                </button>
-              )
-            })}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, padding: '0 8px', height: 28, borderRadius: 0, border: '1px solid #e5e7eb', background: '#fff' }}>
+            <span style={{ fontSize: '0.66rem', fontWeight: 800, color: sheetColor }}>fx</span>
+            <span style={{ fontSize: '0.68rem', color: selectedCell ? '#0f172a' : '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {selectedCell ? fmt(selectedCellValue) || 'Empty cell' : 'Select any cell to inspect or edit its value'}
+            </span>
           </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '0 10px', flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-            <div style={{ display: 'flex', alignItems: 'center', background: '#f1f5f9', borderRadius: 6, padding: '5px 10px', gap: 8, minWidth: 180, maxWidth: 260 }}>
-              <Search size={13} color="var(--muted)" />
-              <input
-                value={searchTerm}
-                onChange={(event) => setSearchTerm(event.target.value)}
-                placeholder="Search..."
-                style={{ border: 'none', background: 'transparent', fontSize: '0.76rem', color: 'var(--text)', width: '100%' }}
-              />
-              {searchTerm ? (
-                <button onClick={() => setSearchTerm('')} style={{ background: 'none', border: 'none', padding: 0, display: 'flex' }}>
-                  <X size={12} color="var(--muted)" />
-                </button>
-              ) : null}
-            </div>
-
-            <button
-              onClick={() => setShowFilters((current) => !current)}
-              style={{
-                background: showFilters ? sheetBgLight : '#f1f5f9',
-                color: showFilters ? sheetColor : 'var(--muted)',
-                border: showFilters ? `1px solid ${sheetColor}44` : '1px solid transparent',
-                borderRadius: 6,
-                padding: '6px 10px',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-                fontSize: '0.68rem',
-                fontWeight: 700,
-                cursor: 'pointer',
-              }}
-            >
-              <Filter size={13} />
-              Filters
-            </button>
-
-            <button
-              onClick={() => setShowColManager((current) => !current)}
-              style={{
-                background: '#f1f5f9',
-                color: 'var(--muted)',
-                border: '1px solid transparent',
-                borderRadius: 6,
-                padding: '6px 10px',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-                fontSize: '0.68rem',
-                fontWeight: 700,
-                cursor: 'pointer',
-              }}
-            >
-              <Eye size={13} />
-              Columns
-            </button>
-
-            {canEdit ? (
-              <button
-                onClick={addRow}
-                style={{
-                  background: sheetColor,
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: 6,
-                  padding: '6px 12px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  fontSize: '0.68rem',
-                  fontWeight: 700,
-                  cursor: 'pointer',
-                }}
-              >
-                <Plus size={13} />
-                Add Row
-              </button>
-            ) : null}
+          <div style={{ fontSize: '0.64rem', color: '#64748b', fontWeight: 700, whiteSpace: 'nowrap' }}>
+            {metadata.updatedAt ? formatDateTime(metadata.updatedAt) : ((stagedImport || metadata.importMeta)?.importedAt ? formatDateTime((stagedImport || metadata.importMeta).importedAt) : 'No timestamp')}
           </div>
         </div>
 
-        {showFilters ? (
-          <div style={{ display: 'flex', gap: 12, padding: '8px 12px', background: sheetBgLight, borderBottom: '1px solid var(--ghost-border)', flexShrink: 0, flexWrap: 'wrap' }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <label style={{ fontSize: '0.62rem', fontWeight: 800, color: sheetColor, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Status</label>
-              <select value={filterStatus} onChange={(event) => setFilterStatus(event.target.value)} style={{ padding: '5px 8px', borderRadius: 5, border: '1px solid var(--ghost-border)', background: '#fff', fontSize: '0.76rem', cursor: 'pointer' }}>
-                <option value="">All Statuses</option>
-                {STATUS_FILTER_OPTIONS.map((status) => (
-                  <option key={status} value={status}>{status}</option>
-                ))}
-              </select>
+        {stagedImport && showImportBanner ? (
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, padding: '4px 10px', borderBottom: '1px solid #dbeafe', background: '#eff6ff', color: '#1d4ed8', flexShrink: 0 }}>
+            <div style={{ fontSize: '0.64rem', lineHeight: 1.3, minWidth: 0, overflowWrap: 'anywhere' }}>
+              <strong>{stagedImport.sourceFileName}</strong> is staged with {stagedImport.totalRows.toLocaleString('en-IN')} rows and {formatCurrency(stagedImport.totalCost)} total costing.
+              {stagedImport.extraSheets?.length ? ` ${stagedImport.extraSheets.length} extra workbook tab(s) were ignored.` : ''}
             </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <label style={{ fontSize: '0.62rem', fontWeight: 800, color: sheetColor, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Type</label>
-              <select value={filterType} onChange={(event) => setFilterType(event.target.value)} style={{ padding: '5px 8px', borderRadius: 5, border: '1px solid var(--ghost-border)', background: '#fff', fontSize: '0.76rem', cursor: 'pointer' }}>
-                <option value="">All Types</option>
-                {['PCR', 'TBR', 'OTR', '2W', 'LCV'].map((type) => (
-                  <option key={type} value={type}>{type}</option>
-                ))}
-              </select>
-            </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <label style={{ fontSize: '0.62rem', fontWeight: 800, color: sheetColor, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Page Size</label>
-              <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))} style={{ padding: '5px 8px', borderRadius: 5, border: '1px solid var(--ghost-border)', background: '#fff', fontSize: '0.76rem', cursor: 'pointer' }}>
-                {PAGE_SIZE_OPTIONS.map((size) => (
-                  <option key={size} value={size}>{size} rows</option>
-                ))}
-              </select>
-            </div>
-
-            <div style={{ display: 'flex', alignItems: 'flex-end' }}>
-              <button onClick={() => { setFilterStatus(''); setFilterType(''); setSearchTerm(''); setSelectedCell(null) }} style={{ background: 'none', border: '1px solid var(--ghost-border)', borderRadius: 5, padding: '5px 10px', fontSize: '0.72rem', fontWeight: 700, color: 'var(--muted)', cursor: 'pointer' }}>
-                Clear All
-              </button>
-            </div>
-
-            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'flex-end', color: 'var(--muted)', fontSize: '0.75rem' }}>
-              {filteredRows.length} of {(sheetData[activeSheet] || []).length} rows
-            </div>
-          </div>
-        ) : null}
-
-        {showColManager ? (
-          <div style={{ padding: '8px 12px', background: '#f8fafc', borderBottom: '1px solid var(--ghost-border)', flexShrink: 0 }}>
-            <p style={{ margin: '0 0 8px', fontSize: '0.66rem', fontWeight: 800, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-              Toggle Columns - {SHEET_CONFIG[activeSheet].label}
-            </p>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {currentCols.map((column) => {
-                const hidden = Boolean(hiddenCols[`${activeSheet}:${column.key}`])
-
-                return (
-                  <button
-                    key={column.key}
-                    onClick={() => toggleCol(column.key)}
-                    style={{
-                      padding: '4px 10px',
-                      borderRadius: 20,
-                      fontSize: '0.66rem',
-                      fontWeight: 700,
-                      border: `1px solid ${hidden ? '#e2e8f0' : sheetColor}`,
-                      background: hidden ? '#f1f5f9' : sheetBgLight,
-                      color: hidden ? '#94a3b8' : sheetColor,
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 5,
-                    }}
-                  >
-                    {hidden ? <EyeOff size={11} /> : <Eye size={11} />}
-                    {column.label}
-                  </button>
-                )
-              })}
-            </div>
+            <button type="button" onClick={() => setShowImportBanner(false)} style={{ background: 'transparent', border: 'none', color: '#1d4ed8', cursor: 'pointer', fontWeight: 700, flexShrink: 0, fontSize: '0.64rem' }}>
+              Hide
+            </button>
           </div>
         ) : null}
 
@@ -1199,22 +1006,22 @@ export default function Costing() {
           onKeyDown={handleGridKeyDown}
           onPaste={handleGridPaste}
           onMouseDown={() => tableWrapperRef.current?.focus()}
-          style={{ flex: 1, overflow: 'auto', minWidth: 0, outline: 'none', position: 'relative', padding: 0 }}
+          style={{ flex: 1, overflow: 'auto', minWidth: 0, outline: 'none', position: 'relative', padding: 0, background: '#fff' }}
         >
           {pageRows.length === 0 ? (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 280, gap: 12, color: 'var(--muted)' }}>
               <FileSpreadsheet size={40} color={sheetColor} style={{ opacity: 0.35 }} />
-              <p style={{ fontWeight: 600, fontSize: '0.9rem' }}>No records{searchTerm || filterStatus || filterType ? ' matching filters' : ' yet'}</p>
-              {canEdit && !searchTerm && !filterStatus && !filterType ? (
+              <p style={{ fontWeight: 600, fontSize: '0.9rem' }}>No records yet</p>
+              {canEdit ? (
                 <button
                   onClick={addRow}
                   style={{
                     background: sheetColor,
                     color: '#fff',
                     border: 'none',
-                    borderRadius: 6,
+                    borderRadius: 8,
                     padding: '9px 20px',
-                    fontSize: '0.78rem',
+                    fontSize: '0.74rem',
                     fontWeight: 700,
                     cursor: 'pointer',
                     display: 'flex',
@@ -1228,7 +1035,7 @@ export default function Costing() {
               ) : null}
             </div>
           ) : (
-            <table style={{ borderCollapse: 'separate', borderSpacing: 0, tableLayout: 'fixed', fontSize: '0.82rem', minWidth: '100%', width: 'max-content' }}>
+            <table style={{ borderCollapse: 'separate', borderSpacing: 0, tableLayout: 'fixed', fontSize: '0.72rem', minWidth: '100%', width: 'max-content' }}>
               <thead>
                 <tr style={{ position: 'sticky', top: 0, zIndex: 10 }}>
                   {visibleCols.map((column, columnIndex) => (
@@ -1238,16 +1045,16 @@ export default function Costing() {
                         width: column.width,
                         minWidth: column.width,
                         maxWidth: column.width,
-                        background: '#f1f5f9',
-                        color: sheetColor,
+                        background: '#f7f8fa',
+                        color: '#6b7280',
                         fontWeight: 800,
-                        fontSize: '0.62rem',
+                        fontSize: '0.54rem',
                         letterSpacing: '0.04em',
                         textTransform: 'uppercase',
-                        borderRight: '1px solid var(--ghost-border)',
-                        borderBottom: `2px solid ${sheetColor}33`,
-                        padding: '8px 10px',
-                        textAlign: 'left',
+                        borderRight: '1px solid #eceff3',
+                        borderBottom: '1px solid #d9dee5',
+                        padding: '6px 8px',
+                        textAlign: column.key === 'sno' ? 'center' : 'left',
                         whiteSpace: 'nowrap',
                         overflow: 'hidden',
                         textOverflow: 'ellipsis',
@@ -1263,16 +1070,16 @@ export default function Costing() {
 
                   <th
                     style={{
-                      width: canEdit ? 88 : 54,
-                      minWidth: canEdit ? 88 : 54,
-                      background: '#f1f5f9',
-                      borderBottom: `2px solid ${sheetColor}33`,
+                      width: canEdit ? 76 : 48,
+                      minWidth: canEdit ? 76 : 48,
+                      background: '#f7f8fa',
+                      borderBottom: '1px solid #d9dee5',
                       position: 'sticky',
                       right: 0,
                       zIndex: 15,
                       textAlign: 'center',
-                      color: 'var(--muted)',
-                      fontSize: '0.62rem',
+                      color: '#6b7280',
+                      fontSize: '0.54rem',
                       textTransform: 'uppercase',
                       letterSpacing: '0.06em',
                     }}
@@ -1286,13 +1093,13 @@ export default function Costing() {
                 {pageRows.map((row, rowIndex) => {
                   const sourceIndex = row.__sourceIndex
                   const isEven = rowIndex % 2 === 0
-                  const rowBg = isEven ? '#fff' : '#fafbfc'
+                  const rowBg = '#fff'
 
                   return (
                     <tr
                       key={`${activeSheet}-${sourceIndex}`}
                       style={{ background: rowBg }}
-                      onMouseEnter={(event) => { event.currentTarget.style.background = `${sheetColor}0a` }}
+                      onMouseEnter={(event) => { event.currentTarget.style.background = '#fbfdff' }}
                       onMouseLeave={(event) => { event.currentTarget.style.background = rowBg }}
                     >
                       {visibleCols.map((column, columnIndex) => {
@@ -1352,46 +1159,46 @@ export default function Costing() {
                         )
                       })}
 
-                      <td style={{ borderBottom: '1px solid #f1f5f9', textAlign: 'center', padding: '0 8px', position: 'sticky', right: 0, background: rowBg, zIndex: 4 }}>
+                      <td style={{ borderBottom: '1px solid #edf1f5', textAlign: 'center', padding: '0 4px', position: 'sticky', right: 0, background: rowBg, zIndex: 4 }}>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
                           <button
                             type="button"
                             onClick={() => setSelectedDetailRowIndex(sourceIndex)}
                             title="View row details"
                             style={{
-                              background: `${sheetColor}12`,
-                              border: '1px solid transparent',
+                              background: 'transparent',
+                              border: 'none',
                               color: sheetColor,
-                              width: 30,
-                              height: 30,
-                              borderRadius: 8,
+                              width: 22,
+                              height: 22,
+                              borderRadius: 0,
                               cursor: 'pointer',
                               display: 'inline-flex',
                               alignItems: 'center',
                               justifyContent: 'center',
                             }}
                           >
-                            <Eye size={14} />
+                            <Eye size={13} />
                           </button>
                           {canEdit ? (
                             <button
                               type="button"
                               onClick={() => deleteRow(sourceIndex)}
                               title="Delete row"
-                              style={{
-                                background: '#fff1f2',
-                                border: '1px solid transparent',
-                                cursor: 'pointer',
-                                color: '#e11d48',
-                                width: 30,
-                                height: 30,
-                                borderRadius: 8,
-                                display: 'inline-flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
+                            style={{
+                              background: 'transparent',
+                              border: 'none',
+                              cursor: 'pointer',
+                              color: '#e11d48',
+                              width: 22,
+                              height: 22,
+                              borderRadius: 0,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
                               }}
                             >
-                              <X size={14} />
+                              <X size={13} />
                             </button>
                           ) : null}
                         </div>
@@ -1404,10 +1211,10 @@ export default function Costing() {
                   <tr
                     onClick={addRow}
                     style={{ cursor: 'pointer', opacity: 0.4 }}
-                    onMouseEnter={(event) => { event.currentTarget.style.opacity = 1; event.currentTarget.style.background = `${sheetColor}08` }}
+                    onMouseEnter={(event) => { event.currentTarget.style.opacity = 1; event.currentTarget.style.background = '#fbfdff' }}
                     onMouseLeave={(event) => { event.currentTarget.style.opacity = 0.4; event.currentTarget.style.background = 'transparent' }}
                   >
-                    <td colSpan={visibleCols.length + 1} style={{ padding: '10px 14px', borderTop: '1px dashed var(--ghost-border)', color: sheetColor, fontWeight: 700, fontSize: '0.75rem' }}>
+                    <td colSpan={visibleCols.length + 1} style={{ padding: '9px 12px', borderTop: '1px dashed #dbe2ea', color: sheetColor, fontWeight: 700, fontSize: '0.7rem' }}>
                       Click to add new row
                     </td>
                   </tr>
@@ -1419,32 +1226,82 @@ export default function Costing() {
 
         <div
           style={{
-            display: 'flex',
-            justifyContent: 'space-between',
+            display: 'grid',
+            gridTemplateColumns: 'minmax(0, 1fr) auto',
             alignItems: 'center',
-            padding: '8px 12px',
+            padding: '0',
             background: '#f8fafc',
-            borderTop: '1px solid var(--ghost-border)',
+            borderTop: '1px solid #dfe5ec',
             flexShrink: 0,
-            fontSize: '0.7rem',
+            fontSize: '0.66rem',
             color: 'var(--muted)',
-            flexWrap: 'wrap',
-            gap: 10,
+            minWidth: 0,
           }}
         >
-          <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
-            <span><strong style={{ color: 'var(--text)' }}>{filteredRows.length}</strong> rows filtered</span>
-            <span>Sheet: <strong style={{ color: sheetColor }}>{SHEET_CONFIG[activeSheet].label}</strong></span>
-            <span><strong style={{ color: 'var(--text)' }}>{visibleCols.length}</strong> of <strong style={{ color: 'var(--text)' }}>{currentCols.length}</strong> columns visible</span>
-            <span>Page <strong style={{ color: 'var(--text)' }}>{currentPage}</strong> / <strong style={{ color: 'var(--text)' }}>{pageCount}</strong></span>
+          <div style={{ display: 'flex', alignItems: 'stretch', minWidth: 0, overflow: 'hidden' }}>
+            <div style={{ display: 'flex', overflow: 'auto', minWidth: 0, borderRight: '1px solid #dfe5ec' }}>
+              {SHEET_KEYS.map((sheetKey) => {
+                const config = SHEET_CONFIG[sheetKey]
+                const isActive = activeSheet === sheetKey
+                const count = (sheetData[sheetKey] || []).length
+
+                return (
+                  <button
+                    key={sheetKey}
+                    type="button"
+                    onClick={() => setActiveSheet(sheetKey)}
+                    style={{
+                      minHeight: 34,
+                      padding: '0 12px',
+                      border: 'none',
+                      borderTop: isActive ? `2px solid ${config.color}` : '2px solid transparent',
+                      background: isActive ? '#fff' : 'transparent',
+                      color: isActive ? '#111827' : '#6b7280',
+                      fontWeight: isActive ? 800 : 700,
+                      fontSize: '0.64rem',
+                      letterSpacing: '0.03em',
+                      cursor: 'pointer',
+                      whiteSpace: 'nowrap',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                    }}
+                  >
+                    <span>{config.label}</span>
+                    <span
+                      style={{
+                        minWidth: 18,
+                        padding: '0 4px',
+                        borderRadius: 0,
+                        background: 'transparent',
+                        color: isActive ? config.color : '#9ca3af',
+                        fontSize: '0.56rem',
+                        fontWeight: 800,
+                        textAlign: 'center',
+                      }}
+                    >
+                      {count}
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 16, padding: '0 10px', minWidth: 0, whiteSpace: 'nowrap' }}>
+              <span><strong style={{ color: '#0f172a' }}>{filteredRows.length}</strong> rows</span>
+              <span><strong style={{ color: '#0f172a' }}>{visibleCols.length}</strong> of <strong style={{ color: '#0f172a' }}>{currentCols.length}</strong> columns visible</span>
+              <span>{dirty ? 'Unsaved changes' : 'All changes saved'}</span>
+            </div>
           </div>
 
-          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '4px 10px', borderLeft: '1px solid #dfe5ec', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <span>Page <strong style={{ color: '#0f172a' }}>{currentPage}</strong> / <strong style={{ color: '#0f172a' }}>{pageCount}</strong></span>
             <button
               type="button"
               className="button button-secondary"
               onClick={() => setPage((current) => Math.max(1, current - 1))}
               disabled={currentPage === 1}
+              style={{ minHeight: 24, padding: '0 8px', fontSize: '0.62rem', borderRadius: 0, background: 'transparent' }}
             >
               Prev
             </button>
@@ -1453,11 +1310,12 @@ export default function Costing() {
               className="button button-secondary"
               onClick={() => setPage((current) => Math.min(pageCount, current + 1))}
               disabled={currentPage === pageCount}
+              style={{ minHeight: 24, padding: '0 8px', fontSize: '0.62rem', borderRadius: 0, background: 'transparent' }}
             >
               Next
             </button>
             <span>
-              Total Costing: <strong style={{ color: sheetColor, fontSize: '0.9rem' }}>₹{stats.totalCost.toLocaleString('en-IN')}</strong>
+              Total Costing: <strong style={{ color: sheetColor, fontSize: '0.8rem' }}>₹{stats.totalCost.toLocaleString('en-IN')}</strong>
             </span>
             {dirty ? (
               <button
@@ -1467,9 +1325,10 @@ export default function Costing() {
                   background: sheetColor,
                   color: '#fff',
                   border: 'none',
-                  borderRadius: 5,
-                  padding: '6px 14px',
-                  fontSize: '0.72rem',
+                  borderRadius: 2,
+                  padding: '0 10px',
+                  minHeight: 24,
+                  fontSize: '0.62rem',
                   fontWeight: 700,
                   cursor: 'pointer',
                   display: 'flex',
@@ -1560,6 +1419,23 @@ export default function Costing() {
                   <span className="detail-value">{(stagedImport || metadata.importMeta)?.importedAt ? formatDateTime((stagedImport || metadata.importMeta).importedAt) : '—'}</span>
                 </div>
                 <div className="detail-field">
+                  <span className="detail-label">Imported File</span>
+                  <span className="detail-value">
+                    {(stagedImport || metadata.importMeta)?.downloadURL ? (
+                      <a
+                        href={(stagedImport || metadata.importMeta).downloadURL}
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{ color: sheetColor, textDecoration: 'none', fontWeight: 700 }}
+                      >
+                        Open workbook
+                      </a>
+                    ) : (
+                      'Not uploaded yet'
+                    )}
+                  </span>
+                </div>
+                <div className="detail-field">
                   <span className="detail-label">Updated By</span>
                   <span className="detail-value">{metadata.updatedBy || '—'}</span>
                 </div>
@@ -1628,9 +1504,13 @@ function CostingCell({
     onEndEdit()
   }
 
+  const cellBackground = col.key === 'sno'
+    ? (isFillPreview ? `${sheetColor}14` : '#f8fafc')
+    : (isFillPreview ? `${sheetColor}14` : rowBackground)
+
   const tdStyle = {
-    borderRight: '1px solid #f1f5f9',
-    borderBottom: '1px solid #f1f5f9',
+    borderRight: '1px solid #eceff3',
+    borderBottom: '1px solid #eceff3',
     padding: 0,
     verticalAlign: 'middle',
     minWidth: col.width,
@@ -1639,7 +1519,7 @@ function CostingCell({
     position: isSticky ? 'sticky' : 'relative',
     left: isSticky ? 0 : 'auto',
     overflow: 'hidden',
-    background: isFillPreview ? `${sheetColor}14` : rowBackground,
+    background: cellBackground,
     boxShadow: isSelected ? `inset 0 0 0 2px ${sheetColor}` : 'none',
     zIndex: isSelected ? 6 : (isSticky ? 3 : 1),
   }
@@ -1653,7 +1533,7 @@ function CostingCell({
         event.preventDefault()
         onHandleMouseDown()
       }}
-      style={{ position: 'absolute', right: 1, bottom: 1, width: 8, height: 8, border: 'none', background: sheetColor, cursor: 'crosshair', borderRadius: 2 }}
+      style={{ position: 'absolute', right: 1, bottom: 1, width: 7, height: 7, border: 'none', background: sheetColor, cursor: 'crosshair', borderRadius: 2 }}
     />
   ) : null
 
@@ -1665,7 +1545,7 @@ function CostingCell({
 
   if (col.readOnly || !canEdit) {
     return (
-      <td {...displayHandlers} style={{ ...tdStyle, padding: '8px 10px', color: col.key === 'sno' ? 'var(--text)' : 'var(--muted)', fontSize: '0.75rem', textAlign: col.key === 'sno' ? 'center' : 'left', fontWeight: col.key === 'sno' ? 700 : 500 }}>
+      <td {...displayHandlers} style={{ ...tdStyle, padding: '5px 8px', color: col.key === 'sno' ? '#475569' : '#334155', fontSize: '0.68rem', textAlign: col.key === 'sno' ? 'center' : 'left', fontWeight: col.key === 'sno' ? 700 : 500 }}>
         <span style={{ display: 'block', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{fmt(value) || ''}</span>
       </td>
     )
@@ -1677,13 +1557,13 @@ function CostingCell({
     if (!isEditing) {
       return (
         <td {...displayHandlers} style={tdStyle}>
-          <div style={{ padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 36 }}>
+          <div style={{ padding: '4px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', minHeight: 28 }}>
             {value ? (
-              <span style={{ background: style.bg, color: style.color, fontSize: '0.65rem', fontWeight: 800, padding: '2px 8px', borderRadius: 10, whiteSpace: 'nowrap' }}>
+              <span style={{ color: style.color, fontSize: '0.68rem', fontWeight: 600, whiteSpace: 'nowrap' }}>
                 {style.label}
               </span>
             ) : (
-              <span style={{ color: '#cbd5e1', fontSize: '0.7rem' }}>-</span>
+              <span style={{ color: '#cbd5e1', fontSize: '0.66rem' }}>-</span>
             )}
             {fillHandle}
           </div>
@@ -1698,7 +1578,7 @@ function CostingCell({
           value={localVal}
           onChange={(event) => setLocalVal(event.target.value)}
           onBlur={commit}
-          style={{ width: '100%', height: '100%', border: 'none', padding: '6px 8px', fontSize: '0.78rem', background: '#fff', cursor: 'pointer' }}
+          style={{ width: '100%', height: '100%', border: 'none', padding: '5px 8px', fontSize: '0.72rem', background: '#fff', cursor: 'pointer' }}
         >
           {STATUS_OPTIONS.map((status) => (
             <option key={status} value={status}>{status || '-'}</option>
@@ -1711,8 +1591,8 @@ function CostingCell({
   if (col.type === 'select' && col.options) {
     if (!isEditing) {
       return (
-        <td {...displayHandlers} style={{ ...tdStyle, padding: '8px 10px', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          <span style={{ fontSize: '0.78rem', color: value ? 'var(--text)' : '#cbd5e1' }}>{value || '-'}</span>
+        <td {...displayHandlers} style={{ ...tdStyle, padding: '5px 8px', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          <span style={{ fontSize: '0.68rem', color: value ? 'var(--text)' : '#cbd5e1' }}>{value || '-'}</span>
           {fillHandle}
         </td>
       )
@@ -1725,7 +1605,7 @@ function CostingCell({
           value={localVal}
           onChange={(event) => setLocalVal(event.target.value)}
           onBlur={commit}
-          style={{ width: '100%', height: '100%', border: 'none', padding: '6px 8px', fontSize: '0.78rem', background: '#fff', cursor: 'pointer' }}
+          style={{ width: '100%', height: '100%', border: 'none', padding: '5px 8px', fontSize: '0.72rem', background: '#fff', cursor: 'pointer' }}
         >
           {(col.options || []).map((option) => (
             <option key={option} value={option}>{option || '-'}</option>
@@ -1738,8 +1618,8 @@ function CostingCell({
   if (col.type === 'currency') {
     if (!isEditing) {
       return (
-        <td {...displayHandlers} style={{ ...tdStyle, padding: '8px 10px', cursor: 'text', textAlign: 'right' }}>
-          <span style={{ fontSize: '0.78rem', fontWeight: 700, color: value ? '#0f766e' : '#cbd5e1', fontFamily: 'monospace' }}>
+        <td {...displayHandlers} style={{ ...tdStyle, padding: '5px 8px', cursor: 'text', textAlign: 'right' }}>
+          <span style={{ fontSize: '0.68rem', fontWeight: 600, color: value ? '#0f766e' : '#cbd5e1', fontFamily: 'monospace' }}>
             {value ? `Rs. ${Number(value).toLocaleString('en-IN')}` : '-'}
           </span>
           {fillHandle}
@@ -1756,7 +1636,7 @@ function CostingCell({
           onChange={(event) => setLocalVal(event.target.value)}
           onBlur={commit}
           onKeyDown={(event) => { if (event.key === 'Enter' || event.key === 'Tab') commit() }}
-          style={{ width: '100%', height: '100%', border: 'none', padding: '6px 10px', fontSize: '0.78rem', textAlign: 'right' }}
+          style={{ width: '100%', height: '100%', border: 'none', padding: '5px 8px', fontSize: '0.72rem', textAlign: 'right' }}
         />
       </td>
     )
@@ -1770,8 +1650,8 @@ function CostingCell({
 
     if (!isEditing) {
       return (
-        <td {...displayHandlers} style={{ ...tdStyle, padding: '8px 10px', cursor: 'text', whiteSpace: 'nowrap' }}>
-          <span style={{ fontSize: '0.75rem', color: value ? 'var(--text)' : '#cbd5e1' }}>{displayVal || '-'}</span>
+        <td {...displayHandlers} style={{ ...tdStyle, padding: '5px 8px', cursor: 'text', whiteSpace: 'nowrap' }}>
+          <span style={{ fontSize: '0.68rem', color: value ? 'var(--text)' : '#cbd5e1' }}>{displayVal || '-'}</span>
           {fillHandle}
         </td>
       )
@@ -1785,7 +1665,7 @@ function CostingCell({
           value={localVal?.split('T')[0] || localVal}
           onChange={(event) => setLocalVal(event.target.value)}
           onBlur={commit}
-          style={{ width: '100%', height: '100%', border: 'none', padding: '6px 10px', fontSize: '0.78rem' }}
+          style={{ width: '100%', height: '100%', border: 'none', padding: '5px 8px', fontSize: '0.72rem' }}
         />
       </td>
     )
@@ -1794,17 +1674,17 @@ function CostingCell({
   if (col.type === 'textarea') {
     if (!isEditing) {
       return (
-        <td {...displayHandlers} style={{ ...tdStyle, padding: '8px 10px' }} title={String(value || '')}>
+        <td {...displayHandlers} style={{ ...tdStyle, padding: '5px 8px' }} title={String(value || '')}>
           <span
             style={{
-              fontSize: '0.78rem',
+              fontSize: '0.68rem',
               color: value ? 'var(--text)' : '#cbd5e1',
               display: '-webkit-box',
               WebkitLineClamp: 2,
               WebkitBoxOrient: 'vertical',
               overflow: 'hidden',
-              lineHeight: 1.35,
-              minHeight: 34,
+              lineHeight: 1.3,
+              minHeight: 30,
               paddingRight: isSelected ? 8 : 0,
             }}
           >
@@ -1822,7 +1702,7 @@ function CostingCell({
           value={localVal}
           onChange={(event) => setLocalVal(event.target.value)}
           onBlur={commit}
-          style={{ width: '100%', minHeight: 72, border: 'none', padding: '8px 10px', fontSize: '0.78rem', background: '#fff', resize: 'vertical', fontFamily: 'inherit' }}
+          style={{ width: '100%', minHeight: 64, border: 'none', padding: '7px 8px', fontSize: '0.72rem', background: '#fff', resize: 'vertical', fontFamily: 'inherit' }}
         />
       </td>
     )
@@ -1830,8 +1710,8 @@ function CostingCell({
 
   if (!isEditing) {
     return (
-      <td {...displayHandlers} style={{ ...tdStyle, padding: '8px 10px', cursor: 'text', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={String(value)}>
-        <span style={{ fontSize: '0.78rem', color: value ? 'var(--text)' : '#cbd5e1', paddingRight: isSelected ? 8 : 0 }}>{fmt(value) || ''}</span>
+      <td {...displayHandlers} style={{ ...tdStyle, padding: '5px 8px', cursor: 'text', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={String(value)}>
+        <span style={{ fontSize: '0.68rem', color: value ? 'var(--text)' : '#cbd5e1', paddingRight: isSelected ? 8 : 0 }}>{fmt(value) || ''}</span>
         {fillHandle}
       </td>
     )
@@ -1845,7 +1725,7 @@ function CostingCell({
         onChange={(event) => setLocalVal(event.target.value)}
         onBlur={commit}
         onKeyDown={(event) => { if (event.key === 'Enter' || event.key === 'Tab') commit() }}
-        style={{ width: '100%', height: 36, border: 'none', padding: '6px 10px', fontSize: '0.78rem', background: '#fff' }}
+        style={{ width: '100%', height: 32, border: 'none', padding: '5px 8px', fontSize: '0.72rem', background: '#fff' }}
       />
     </td>
   )

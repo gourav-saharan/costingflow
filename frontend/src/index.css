@@ -272,6 +272,10 @@ button {
   overflow-x: hidden;
 }
 
+.page-shell.page-shell-costing {
+  padding: 0;
+}
+
 .page {
   display: grid;
   gap: 24px;
@@ -1089,6 +1093,48 @@ button {
   color: var(--muted);
   margin-bottom: 12px;
   display: block;
+}
+
+.ocr-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin: 12px 0 4px;
+  padding: 14px 16px;
+  border-radius: 6px;
+  border: 1px solid rgba(37, 99, 235, 0.18);
+  background: #EFF6FF;
+}
+
+.ocr-summary.error {
+  border-color: rgba(197, 48, 48, 0.18);
+  background: #FFF5F5;
+}
+
+.ocr-summary-copy {
+  display: grid;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--on-bg);
+}
+
+.ocr-summary-copy strong {
+  font-size: 0.85rem;
+}
+
+.ocr-attachments-meta {
+  margin-top: 10px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.ocr-inline-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--on-surface);
+  font-size: 0.88rem;
 }
 
 .modal-action-bar {

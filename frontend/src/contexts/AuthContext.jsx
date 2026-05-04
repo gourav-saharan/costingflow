@@ -73,10 +73,6 @@ export function AuthProvider({ children }) {
     }
 
     const nextProfile = profileSnapshot.data()
-    if (nextProfile.status === 'Disabled') {
-      throw new Error('Your account is disabled. Contact HOD.')
-    }
-
     setProfile(nextProfile)
     return nextProfile
   }
