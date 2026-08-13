@@ -1,4 +1,4 @@
-import openpyxl
+9import openpyxl
 import os
 import json
 from datetime import datetime
@@ -29,7 +29,7 @@ def analyze():
                 status = str(row[14]) if row[14] is not None else "None"
                 status_counts[status] = status_counts.get(status, 0) + 1
                 
-                # Month is col 2 (index 1)
+            
                 month_val = row[1]
                 year = "Unknown"
                 if isinstance(month_val, datetime):
