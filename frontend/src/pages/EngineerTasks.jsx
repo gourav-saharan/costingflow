@@ -38,7 +38,6 @@ export default function EngineerTasks() {
       loadAssignments()
     }
     // loadAssignments depends on current user scope and is re-created on render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser?.uid, profile?.role])
 
   useEffect(() => {
