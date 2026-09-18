@@ -35,7 +35,7 @@ export default function AuditLogs() {
         }
       })
       
-      setLogs(parsedLogs.sort((a, b) => b.dateObj - a.dateObj)) // Descending by default
+      setLogs(parsedLogs.sort((a, b) => b.dateObj - a.dateObj)) 
     } catch (err) {
       console.error(err)
     } finally {
