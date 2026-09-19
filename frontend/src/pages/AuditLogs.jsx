@@ -53,7 +53,7 @@ export default function AuditLogs() {
       try {
         const keys = Object.keys(val)
         if (keys.length === 0) return '{}'
-        return String(val[keys[0]]) // Just show first key value for density
+        return String(val[keys[0]]) 
       } catch {
         return 'Object'
       }
