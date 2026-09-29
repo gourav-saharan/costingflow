@@ -20,7 +20,6 @@ export default function AuditLogs() {
       
       const parsedLogs = snapshot.docs.map((doc) => {
         const data = doc.data()
-        // Format timestamp safely
         let dateObj = new Date()
         if (data.timestamp?.toDate) {
           dateObj = data.timestamp.toDate()
