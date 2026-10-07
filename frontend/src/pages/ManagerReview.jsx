@@ -122,7 +122,6 @@ export default function ManagerReview() {
           {selectedReport ? (
             <div className="stack">
               <div className="info-card">
-                <strong>{selectedReport.htacNumber}</strong>
                 <p>{selectedReport.projectId} / {selectedReport.testId}</p>
                 <p>Costing value: {formatCurrency(costingMap[selectedReport.costingId]?.totalCost || 0)}</p>
               </div>
